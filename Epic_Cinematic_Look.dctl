@@ -1,0 +1,247 @@
+// ====================================================================
+// 🎥 ARRI LogC4 → Rec.709 - ULTIMATE PIPELINE (PRE-RECOVERY)
+// ====================================================================
+
+DEFINE_UI_PARAMS(p_exposure, Exposure, DCTLUI_SLIDER_FLOAT, 0.0, -4.0, 4.0, 0.1)
+DEFINE_UI_PARAMS(p_lift, Shadow Lift, DCTLUI_SLIDER_FLOAT, -0.02, -0.2, 0.2, 0.005)
+DEFINE_UI_PARAMS(p_midtone, Midtone, DCTLUI_SLIDER_FLOAT, 0.28, -1.0, 1.0, 0.01)
+DEFINE_UI_PARAMS(p_shoulder, Highlight Rolloff, DCTLUI_SLIDER_FLOAT, 1.0, 0.2, 2.0, 0.05)
+DEFINE_UI_PARAMS(p_highlight_recovery, Highlight Recovery, DCTLUI_CHECK_BOX, 1)
+DEFINE_UI_PARAMS(p_gamma_out, Gamma Mode, DCTLUI_COMBO_BOX, 0, { GAM_24, GAM_22, GAM_709, GAM_LIN }, { Gamma 2.4, Gamma 2.2, Rec.709, Linear })
+DEFINE_UI_PARAMS(p_clip_whites, Asymptotic Clip Whites, DCTLUI_CHECK_BOX, 1)
+DEFINE_UI_PARAMS(p_clip_k, Clip Softness, DCTLUI_SLIDER_FLOAT, 3.0, 0.5, 10.0, 0.1)
+DEFINE_UI_PARAMS(p_clip_limit, Clip Limit, DCTLUI_SLIDER_FLOAT, 0.99, 0.95, 1.0, 0.005)
+
+// ────────────────────────────────────────────────────────────────────
+// CONSTANTS - ARRI LogC4
+// ────────────────────────────────────────────────────────────────────
+#define LOGC4_OFFSET 0.092809f
+#define LOGC4_SLOPE  0.119214f
+#define LOGC4_SCALE  63.99853515625f
+#define LOGC4_LIN_OFFSET 0.00146484375f
+
+// ────────────────────────────────────────────────────────────────────
+// LOG WHEELS - HIGHLIGHTS (valeurs bakées depuis DaVinci)
+// ────────────────────────────────────────────────────────────────────
+#define LOGW_HL_GAIN   1.0f    // Highlights R=G=B=0.1
+#define LOGW_PIVOT     0.5f   // Pivot des Log Wheels
+#define LOGW_HL_RANGE  0.550f   // ↑ Range (plage haute)
+
+// ────────────────────────────────────────────────────────────────────
+// SHADOW DESATURATION (valeurs bakées, appliquée en espace d'affichage)
+// ────────────────────────────────────────────────────────────────────
+#define SHADOW_DESAT_AMOUNT  1.0f    // Force max de désaturation dans les ombres (0..1)
+#define SHADOW_DESAT_START   0.0f    // Luminance en dessous : désaturation max
+#define SHADOW_DESAT_END     0.44f   // Luminance au dessus : aucune désaturation
+
+// ────────────────────────────────────────────────────────────────────
+// LogC4 → Linear
+// ────────────────────────────────────────────────────────────────────
+__DEVICE__ float logc4_to_linear(float in_val) {
+    return (_powf(2.0f, (in_val - LOGC4_OFFSET) / LOGC4_SLOPE) - LOGC4_LIN_OFFSET) / LOGC4_SCALE;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Log Wheel Highlights (appliqué en espace Log)
+//    Fenêtre douce smoothstep démarrant au pivot, sur la plage haute.
+// ────────────────────────────────────────────────────────────────────
+__DEVICE__ float smoothstep_local(float edge0, float edge1, float x) {
+    float t = (x - edge0) / (edge1 - edge0);
+    t = (t < 0.0f) ? 0.0f : ((t > 1.0f) ? 1.0f : t);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__DEVICE__ float apply_logwheel_highlights(float in_val, float gain) {
+    // Bornes de la fenêtre des hautes lumières
+    float start = LOGW_PIVOT;
+    float end   = LOGW_PIVOT + LOGW_HL_RANGE;
+    // Pondération douce : 0 au pivot, 1 au-delà de la plage
+    float w = smoothstep_local(start, end, in_val);
+    // Gain progressif appliqué aux hautes lumières
+    return in_val * (1.0f + gain * w);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Luminance Rec.709
+// ────────────────────────────────────────────────────────────────────
+__DEVICE__ float luma_709(float r, float g, float b) {
+    return r * 0.2126f + g * 0.7152f + b * 0.0722f;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Désaturation graduelle des ombres (ombres → gris)
+// ────────────────────────────────────────────────────────────────────
+__DEVICE__ float3 apply_shadow_desat(float r, float g, float b) {
+    float y = luma_709(r, g, b);
+    // w = 1 dans les ombres profondes, 0 au dessus de SHADOW_DESAT_END
+    float w = 1.0f - smoothstep_local(SHADOW_DESAT_START, SHADOW_DESAT_END, y);
+    float desat = w * SHADOW_DESAT_AMOUNT;
+    // Mélange vers la luminance (gris)
+    float out_r = r * (1.0f - desat) + y * desat;
+    float out_g = g * (1.0f - desat) + y * desat;
+    float out_b = b * (1.0f - desat) + y * desat;
+    return make_float3(out_r, out_g, out_b);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// PRE-ADJUSTMENT HIGHLIGHT RECOVERY (LINEAR SPACE)
+// ════════════════════════════════════════════════════════════════════
+__DEVICE__ float3 linear_highlight_recovery(float r, float g, float b) {
+    float thr = 1.5f; 
+    
+    float max_val = r;
+    if (g > max_val) max_val = g;
+    if (b > max_val) max_val = b;
+    
+    if (max_val <= thr) return make_float3(r, g, b);
+
+    float excess = max_val - thr;
+    float blend = excess / (excess + 2.0f);
+    
+    float mix_r = (g + b) * 0.5f;
+    float mix_g = (r + b) * 0.5f;
+    float mix_b = (r + g) * 0.5f;
+    
+    float result_r = r;
+    float result_g = g;
+    float result_b = b;
+    
+    if (r > thr) result_r = r * (1.0f - blend) + mix_r * blend;
+    if (g > thr) result_g = g * (1.0f - blend) + mix_g * blend;
+    if (b > thr) result_b = b * (1.0f - blend) + mix_b * blend;
+    
+    return make_float3(result_r, result_g, result_b);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Outils de Contraste / Tonalité
+// ────────────────────────────────────────────────────────────────────
+__DEVICE__ float apply_lift(float in_val, float lift_val) {
+    return in_val * (1.0f - lift_val) + lift_val;
+}
+
+__DEVICE__ float apply_midtone(float in_val, float mid_val) {
+    if (mid_val == 0.0f) return in_val;
+    float power = _powf(2.0f, -mid_val);
+    float abs_val = _fabs(in_val);
+    float result = _powf(abs_val, power);
+    return (in_val < 0.0f) ? -result : result;
+}
+
+__DEVICE__ float apply_shoulder(float x, float shoulder) {
+    if (x <= 0.0f) return x;
+    float a = 2.51f * shoulder;
+    float b = 0.03f;
+    float c = 2.43f;
+    float d = 0.59f;
+    float e = 0.14f;
+    float out_val = (x * (a * x + b)) / (x * (c * x + d) + e);
+    return (out_val > 1.0f) ? 1.0f : out_val;
+}
+
+__DEVICE__ float apply_asymptotic_clip(float in_val, float limit, float k) {
+    if (in_val <= 0.0f) return in_val;
+    return limit * (1.0f - _expf(-k * in_val));
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Rec.709 Gamma & Matrix
+// ────────────────────────────────────────────────────────────────────
+__DEVICE__ float apply_rec709_gamma(float in_val) {
+    float abs_val = _fabs(in_val);
+    float lin_threshold = 0.018f;
+    float gamma_val;
+    if (abs_val <= lin_threshold) {
+        gamma_val = 4.5f * abs_val;
+    } else {
+        gamma_val = 1.09929682680944f * _powf(abs_val, 0.45f) - 0.099296826809442f;
+    }
+    return (in_val < 0.0f) ? -gamma_val : gamma_val;
+}
+
+__DEVICE__ float apply_gamma(float in_val, int mode) {
+    float abs_val = _fabs(in_val);
+    float gamma_val;
+    
+    if (mode == 0) {
+        gamma_val = _powf(abs_val, 1.0f / 2.4f);
+    } else if (mode == 1) {
+        gamma_val = _powf(abs_val, 1.0f / 2.2f);
+    } else if (mode == 2) {
+        return apply_rec709_gamma(in_val);
+    } else {
+        gamma_val = abs_val;
+    }
+    return (in_val < 0.0f) ? -gamma_val : gamma_val;
+}
+
+__DEVICE__ float3 apply_matrix(float r, float g, float b) {
+    float r_709 = r * 1.8344f + g * -0.6865f + b * -0.1479f;
+    float g_709 = r * -0.1147f + g * 1.2334f + b * -0.1187f;
+    float b_709 = r * -0.0210f + g * -0.1118f + b * 1.1328f;
+    return make_float3(r_709, g_709, b_709);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// MAIN TRANSFORMATION
+// ════════════════════════════════════════════════════════════════════
+__DEVICE__ float3 transform(int p_Width, int p_Height, int p_X, int p_Y, float p_R, float p_G, float p_B)
+{
+    // Step 1: LOG WHEELS - Highlights (en espace Log, comme DaVinci)
+    float r_log = apply_logwheel_highlights(p_R, LOGW_HL_GAIN);
+    float g_log = apply_logwheel_highlights(p_G, LOGW_HL_GAIN);
+    float b_log = apply_logwheel_highlights(p_B, LOGW_HL_GAIN);
+
+    // Step 2: LogC4 → Linear
+    float r_lin = logc4_to_linear(r_log);
+    float g_lin = logc4_to_linear(g_log);
+    float b_lin = logc4_to_linear(b_log);
+
+    // Step 3: HIGHLIGHT RECOVERY (signal capteur brut)
+    if (p_highlight_recovery == 1) {
+        float3 rgb_rec = linear_highlight_recovery(r_lin, g_lin, b_lin);
+        r_lin = rgb_rec.x;
+        g_lin = rgb_rec.y;
+        b_lin = rgb_rec.z;
+    }
+
+    // Step 4: Exposure Compensation
+    float exp_scale = _powf(2.0f, p_exposure);
+    r_lin = r_lin * exp_scale;
+    g_lin = g_lin * exp_scale;
+    b_lin = b_lin * exp_scale;
+
+    // Step 5: AWG4 → Rec.709 Color Space Matrix
+    float3 rgb_709 = apply_matrix(r_lin, g_lin, b_lin);
+
+    // Step 6: Contrast Tools
+    float r_lifted = apply_lift(rgb_709.x, p_lift);
+    float g_lifted = apply_lift(rgb_709.y, p_lift);
+    float b_lifted = apply_lift(rgb_709.z, p_lift);
+
+    float r_mid = apply_midtone(r_lifted, p_midtone);
+    float g_mid = apply_midtone(g_lifted, p_midtone);
+    float b_mid = apply_midtone(b_lifted, p_midtone);
+
+    // Step 7: Highlight Roll-off (Shoulder)
+    float r_shoulder = apply_shoulder(r_mid, p_shoulder);
+    float g_shoulder = apply_shoulder(g_mid, p_shoulder);
+    float b_shoulder = apply_shoulder(b_mid, p_shoulder);
+
+    // Step 8: Final Clipping Protection
+    if (p_clip_whites == 1) {
+        r_shoulder = apply_asymptotic_clip(r_shoulder, p_clip_limit, p_clip_k);
+        g_shoulder = apply_asymptotic_clip(g_shoulder, p_clip_limit, p_clip_k);
+        b_shoulder = apply_asymptotic_clip(b_shoulder, p_clip_limit, p_clip_k);
+    }
+
+    // Step 9: OETF Gamma
+    float r_out = apply_gamma(r_shoulder, p_gamma_out);
+    float g_out = apply_gamma(g_shoulder, p_gamma_out);
+    float b_out = apply_gamma(b_shoulder, p_gamma_out);
+
+    // Step 10: Désaturation graduelle des ombres (en espace d'affichage)
+    float3 rgb_final = apply_shadow_desat(r_out, g_out, b_out);
+
+    return rgb_final;
+}
